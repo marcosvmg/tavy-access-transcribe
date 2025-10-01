@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { supabase } from "@/integrations/supabase/client";
 import { TranscriptionInput } from "@/components/TranscriptionInput";
 import { ProcessingIndicator } from "@/components/ProcessingIndicator";
 import { TranscriptionEditor } from "@/components/TranscriptionEditor";
@@ -12,59 +13,59 @@ const Index = () => {
   const [processingStatus, setProcessingStatus] = useState("");
   const [videoTitle, setVideoTitle] = useState("");
   const [transcription, setTranscription] = useState("");
+  const [hasQualityIssues, setHasQualityIssues] = useState(false);
 
-  const simulateProcessing = async (url: string) => {
+  const processTranscription = async (url: string) => {
     setState("processing");
     setProgress(0);
     setProcessingStatus("Iniciando processamento...");
 
-    // Simulate video title extraction
-    const videoId = extractVideoId(url);
-    setVideoTitle(`Vídeo do YouTube - ${videoId}`);
+    try {
+      // Simulate progress steps with updates
+      const progressInterval = setInterval(() => {
+        setProgress((prev) => {
+          if (prev >= 90) return prev;
+          return prev + 10;
+        });
+      }, 500);
 
-    // Simulate progress steps
-    const steps = [
-      { progress: 25, status: "Extraindo áudio do vídeo...", delay: 1500 },
-      { progress: 50, status: "Detectando idioma...", delay: 1000 },
-      { progress: 75, status: "Transcrevendo com máxima precisão...", delay: 2000 },
-      { progress: 100, status: "Formatando e adicionando timestamps...", delay: 1000 },
-    ];
+      setProcessingStatus("Extraindo informações do vídeo...");
 
-    for (const step of steps) {
-      await new Promise((resolve) => setTimeout(resolve, step.delay));
-      setProgress(step.progress);
-      setProcessingStatus(step.status);
+      const { data, error: functionError } = await supabase.functions.invoke('transcribe-youtube', {
+        body: { videoUrl: url }
+      });
+
+      clearInterval(progressInterval);
+
+      if (functionError) {
+        throw new Error(functionError.message);
+      }
+
+      if (!data.success) {
+        throw new Error(data.error || 'Erro ao processar o vídeo');
+      }
+
+      setProgress(100);
+      setProcessingStatus("Transcrição concluída!");
+      setVideoTitle(data.videoTitle);
+      setTranscription(data.transcript);
+      setHasQualityIssues(data.hasNoise || false);
+      
+      toast.success("Transcrição concluída com sucesso!");
+      
+      setTimeout(() => {
+        setState("editor");
+      }, 500);
+
+    } catch (err: any) {
+      console.error('Erro na transcrição:', err);
+      toast.error(err.message || 'Erro ao transcrever o vídeo. Tente novamente.');
+      setState("input");
     }
-
-    // Simulate transcription result with timestamps
-    const mockTranscription = `[00:00] Olá, bem-vindos ao nosso canal! Hoje vamos falar sobre um assunto muito importante.
-
-[00:15] A acessibilidade digital é fundamental para garantir que todas as pessoas possam acessar e utilizar recursos online.
-
-[00:35] Orador 2: Isso mesmo! E ferramentas como legendas e transcrições fazem toda a diferença.
-
-[00:50] Vamos começar explicando os principais conceitos de acessibilidade na web...
-
-[01:10] É importante destacar que a inclusão digital não é apenas uma questão técnica, mas também social.
-
-[01:30] Orador 2: Concordo plenamente. Cada pequeno passo em direção à acessibilidade conta.
-
-[01:50] Vamos agora para algumas demonstrações práticas de como implementar essas soluções...`;
-
-    setTranscription(mockTranscription);
-    
-    toast.success("Transcrição concluída com sucesso!");
-    setState("editor");
-  };
-
-  const extractVideoId = (url: string): string => {
-    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
-    const match = url.match(regExp);
-    return match && match[2].length === 11 ? match[2] : "unknown";
   };
 
   const handleStartTranscription = (url: string) => {
-    simulateProcessing(url);
+    processTranscription(url);
   };
 
   const handleBackToInput = () => {
@@ -72,6 +73,7 @@ const Index = () => {
     setProgress(0);
     setTranscription("");
     setVideoTitle("");
+    setHasQualityIssues(false);
   };
 
   return (
@@ -92,7 +94,7 @@ const Index = () => {
           <TranscriptionEditor
             videoTitle={videoTitle}
             transcription={transcription}
-            hasQualityIssues={Math.random() > 0.7}
+            hasQualityIssues={hasQualityIssues}
             onBack={handleBackToInput}
           />
         )}
