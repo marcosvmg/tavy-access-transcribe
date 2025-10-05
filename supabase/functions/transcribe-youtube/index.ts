@@ -154,9 +154,11 @@ async function getYouTubeTranscript(videoId: string) {
 
 function parseXMLTranscript(xml: string): string | null {
   try {
-    const textMatches = xml.matchAll(/<text[^>]*start=\"([^\"]*)\"[^>]*dur=\"([^\"]*)\"[^>]*>([\s\S]*?)<\\/text>/g);
+    // Usar RegExp via string para evitar problemas de parsing de regex literal com </
+    const re = new RegExp('<text[^>]*start="([^"]*)"[^>]*dur="([^"]*)"[^>]*>([\\s\\S]*?)<\\/text>', 'g');
     let result = '';
 
+    const textMatches = xml.matchAll(re);
     for (const match of textMatches) {
       const start = parseFloat(match[1]);
       const raw = match[3]
