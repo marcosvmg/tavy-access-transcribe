@@ -85,7 +85,9 @@ async function getVideoInfo(videoId: string) {
 
   const response = await fetch(url);
   if (!response.ok) {
-    throw new Error('Erro ao obter informações do vídeo');
+    const errorText = await response.text();
+    console.error('YouTube API Error:', errorText);
+    throw new Error('Erro ao obter informações do vídeo. Verifique se a API key está correta e se a YouTube Data API v3 está habilitada.');
   }
 
   const data = await response.json();
@@ -100,60 +102,94 @@ async function getVideoInfo(videoId: string) {
 }
 
 async function getYouTubeTranscript(videoId: string) {
-  // Usar a API do YouTube para obter legendas
-  const apiKey = Deno.env.get('GOOGLE_API_KEY');
+  // Usar a API pública de transcrição do YouTube (timedtext)
+  // Esta API não requer autenticação OAuth e funciona com legendas públicas
   
-  // Primeiro, obter a lista de legendas disponíveis
-  const captionsUrl = `https://www.googleapis.com/youtube/v3/captions?videoId=${videoId}&key=${apiKey}&part=snippet`;
-  
-  const captionsResponse = await fetch(captionsUrl);
-  if (!captionsResponse.ok) {
-    throw new Error('Erro ao obter legendas do vídeo. O vídeo pode não ter legendas disponíveis ou ser privado.');
-  }
-
-  const captionsData = await captionsResponse.json();
-  
-  if (!captionsData.items || captionsData.items.length === 0) {
-    throw new Error('Este vídeo não possui legendas disponíveis. Tente outro vídeo.');
-  }
-
-  // Procurar por legendas em português ou a primeira disponível
-  let captionTrack = captionsData.items.find((item: any) => 
-    item.snippet.language === 'pt' || item.snippet.language === 'pt-BR'
-  );
-  
-  if (!captionTrack) {
-    captionTrack = captionsData.items[0];
-  }
-
-  const captionId = captionTrack.id;
-  const language = captionTrack.snippet.language;
-
-  // Baixar o conteúdo da legenda
-  const downloadUrl = `https://www.googleapis.com/youtube/v3/captions/${captionId}?key=${apiKey}&tfmt=srt`;
-  
-  const transcriptResponse = await fetch(downloadUrl, {
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
+  try {
+    // Primeiro, tentar obter legendas em português
+    const languages = ['pt', 'pt-BR', 'en', 'es'];
+    
+    for (const lang of languages) {
+      try {
+        const url = `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}`;
+        console.log(`Tentando obter legendas em ${lang}:`, url);
+        
+        const response = await fetch(url);
+        
+        if (response.ok) {
+          const text = await response.text();
+          
+          // Verificar se realmente obtivemos legendas
+          if (text && text.trim().length > 0 && !text.includes('<?xml version')) {
+            console.log(`Legendas encontradas em ${lang}`);
+            return {
+              language: lang,
+              text: text,
+            };
+          }
+          
+          // Se for XML, fazer parsing
+          if (text.includes('<?xml version')) {
+            const parsedText = parseXMLTranscript(text);
+            if (parsedText) {
+              console.log(`Legendas XML encontradas em ${lang}`);
+              return {
+                language: lang,
+                text: parsedText,
+              };
+            }
+          }
+        }
+      } catch (err) {
+        console.log(`Erro ao tentar ${lang}:`, err);
+        continue;
+      }
     }
-  });
-
-  if (!transcriptResponse.ok) {
-    // Se não conseguir baixar, vamos usar uma abordagem alternativa
-    // Retornar um formato que simula uma transcrição
-    throw new Error('Não foi possível baixar a transcrição. O vídeo pode ter restrições de acesso às legendas.');
+    
+    throw new Error('Este vídeo não possui legendas disponíveis em português, inglês ou espanhol. Por favor, tente outro vídeo com legendas ativadas.');
+  } catch (error) {
+    console.error('Erro ao obter transcrição:', error);
+    throw error;
   }
+}
 
-  const transcriptText = await transcriptResponse.text();
-  
-  return {
-    language,
-    text: transcriptText,
-  };
+function parseXMLTranscript(xml: string): string | null {
+  try {
+    // Extrair texto de tags <text>
+    const textMatches = xml.matchAll(/<text[^>]*start="([^"]*)"[^>]*dur="([^"]*)"[^>]*>([^<]*)<\/text>/g);
+    let result = '';
+    
+    for (const match of textMatches) {
+      const start = parseFloat(match[1]);
+      const text = match[3]
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
+      
+      // Converter segundos para MM:SS
+      const minutes = Math.floor(start / 60);
+      const seconds = Math.floor(start % 60);
+      const timestamp = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+      
+      result += `[${timestamp}] ${text}\n`;
+    }
+    
+    return result || null;
+  } catch (error) {
+    console.error('Erro ao fazer parsing do XML:', error);
+    return null;
+  }
 }
 
 function formatTranscript(transcript: any): string {
-  // Formatar a transcrição com timestamps
+  // Se já está formatado (do parseXMLTranscript), retornar direto
+  if (transcript.text.includes('[') && transcript.text.includes(']')) {
+    return transcript.text;
+  }
+  
+  // Caso contrário, formatar a transcrição com timestamps
   const lines = transcript.text.split('\n');
   let formatted = '';
   let currentTime = '';
