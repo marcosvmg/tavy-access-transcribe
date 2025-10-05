@@ -7,60 +7,50 @@ const corsHeaders = {
 };
 
 serve(async (req) => {
+  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
     const { videoUrl } = await req.json();
-
-    if (!videoUrl) {
-      throw new Error('URL do vídeo é obrigatória');
-    }
+    if (!videoUrl) throw new Error('URL do vídeo é obrigatória');
 
     console.log('Processando vídeo:', videoUrl);
 
-    // Extrair o ID do vídeo do YouTube
     const videoId = extractVideoId(videoUrl);
-    if (!videoId) {
-      throw new Error('URL do YouTube inválida');
-    }
+    if (!videoId) throw new Error('URL do YouTube inválida');
 
     console.log('ID do vídeo:', videoId);
 
-    // Obter informações do vídeo (sem precisar de API key)
+    // Obter título via oEmbed (sem precisar da YouTube Data API)
     const videoInfo = await getVideoInfo(videoId);
 
-    // Obter a transcrição usando a API pública de legendas do YouTube
-    const transcript = await getYouTubeTranscript(videoId);
+    // Obter legendas públicas/ASR
+    const transcriptData = await getYouTubeTranscript(videoId);
 
-    // Formatar a transcrição com timestamps
-    const formattedTranscript = formatTranscript(transcript);
+    // Formatar
+    const formattedTranscript = formatTranscript(transcriptData);
+    const noSubtitles = !formattedTranscript || formattedTranscript.trim().length === 0;
 
     return new Response(
       JSON.stringify({
         success: true,
         videoTitle: videoInfo.title,
         transcript: formattedTranscript,
-        language: transcript.language || 'pt',
+        language: transcriptData.language || 'pt',
         hasNoise: false,
+        noSubtitles,
+        info: noSubtitles ? 'Sem legendas públicas/ASR disponíveis para este vídeo.' : undefined,
       }),
-      {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      }
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error) {
     console.error('Erro na transcrição:', error);
     const errorMessage = error instanceof Error ? error.message : 'Erro ao processar o vídeo';
     return new Response(
-      JSON.stringify({ 
-        success: false,
-        error: errorMessage
-      }),
-      {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      }
+      JSON.stringify({ success: false, error: errorMessage }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
 });
@@ -70,44 +60,31 @@ function extractVideoId(url: string): string | null {
     /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/,
     /^([a-zA-Z0-9_-]{11})$/,
   ];
-
   for (const pattern of patterns) {
     const match = url.match(pattern);
     if (match) return match[1];
   }
-
   return null;
 }
 
 async function getVideoInfo(videoId: string) {
-  // Usar o endpoint oEmbed do YouTube para obter o título sem precisar de API Key
   const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(watchUrl)}&format=json`;
-
-  const response = await fetch(oembedUrl);
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error('YouTube oEmbed error:', errorText);
-    // Fallback: retornar um título básico em vez de falhar toda a função
-    return {
-      title: `Vídeo ${videoId}`,
-      description: ''
-    };
+  try {
+    const response = await fetch(oembedUrl);
+    if (!response.ok) throw new Error(await response.text());
+    const data = await response.json();
+    return { title: data.title || `Vídeo ${videoId}`, description: '' };
+  } catch (e) {
+    console.error('YouTube oEmbed error:', e);
+    return { title: `Vídeo ${videoId}`, description: '' };
   }
-
-  const data = await response.json();
-  return {
-    title: data.title || `Vídeo ${videoId}`,
-    description: ''
-  };
 }
 
 async function getYouTubeTranscript(videoId: string) {
-  // Usar a API pública de transcrição do YouTube (timedtext)
-  // Funciona com legendas públicas e ASR (auto-geradas)
+  // Busca legendas públicas (timedtext) incluindo ASR e VTT
   try {
     const languages = ['pt', 'pt-BR', 'en', 'es'];
-
     for (const lang of languages) {
       const variants = [
         `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}`,
@@ -115,7 +92,6 @@ async function getYouTubeTranscript(videoId: string) {
         `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}&fmt=vtt`,
         `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}&kind=asr&fmt=vtt`,
       ];
-
       for (const url of variants) {
         try {
           console.log(`Tentando legendas: ${url}`);
@@ -125,18 +101,16 @@ async function getYouTubeTranscript(videoId: string) {
           if (!text || text.trim().length === 0) continue;
 
           if (text.startsWith('WEBVTT')) {
-            const parsed = parseVTTTranscript(text);
-            if (parsed) return { language: lang, text: parsed };
+            const parsedVtt = parseVTTTranscript(text);
+            if (parsedVtt) return { language: lang, text: parsedVtt };
             continue;
           }
-
           if (text.includes('<transcript')) {
-            const parsedText = parseXMLTranscript(text);
-            if (parsedText) return { language: lang, text: parsedText };
+            const parsedXml = parseXMLTranscript(text);
+            if (parsedXml) return { language: lang, text: parsedXml };
             continue;
           }
-
-          // Último recurso, retornar texto cru
+          // Fallback: texto cru
           return { language: lang, text };
         } catch (err) {
           console.log(`Erro ao tentar URL ${url}:`, err);
@@ -144,20 +118,18 @@ async function getYouTubeTranscript(videoId: string) {
         }
       }
     }
-
-    throw new Error('Este vídeo não possui legendas disponíveis em pt, en ou es (públicas/ASR). Tente outro vídeo com legendas.');
+    // Sem legendas: retornar objeto vazio
+    return { language: 'unknown', text: '' };
   } catch (error) {
     console.error('Erro ao obter transcrição:', error);
-    throw error;
+    return { language: 'unknown', text: '' };
   }
 }
 
 function parseXMLTranscript(xml: string): string | null {
   try {
-    // Usar RegExp via string para evitar problemas de parsing de regex literal com </
     const re = new RegExp('<text[^>]*start="([^"]*)"[^>]*dur="([^"]*)"[^>]*>([\\s\\S]*?)<\\/text>', 'g');
     let result = '';
-
     const textMatches = xml.matchAll(re);
     for (const match of textMatches) {
       const start = parseFloat(match[1]);
@@ -168,7 +140,6 @@ function parseXMLTranscript(xml: string): string | null {
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'");
-
       const minutes = Math.floor(start / 60);
       const seconds = Math.floor(start % 60);
       const timestamp = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
@@ -176,7 +147,6 @@ function parseXMLTranscript(xml: string): string | null {
       if (!text) continue;
       result += `[${timestamp}] ${text}\n`;
     }
-
     return result || null;
   } catch (error) {
     console.error('Erro ao fazer parsing do XML:', error);
@@ -201,7 +171,6 @@ function parseVTTTranscript(vtt: string): string | null {
     for (const line of lines) {
       const l = line.trim();
       if (!l) { flush(); continue; }
-      // Ex: 00:00:05.000 --> 00:00:07.000
       if (l.includes('-->')) {
         flush();
         const start = l.split('-->')[0].trim();
@@ -211,7 +180,7 @@ function parseVTTTranscript(vtt: string): string | null {
         currentTime = `${mm.padStart(2,'0')}:${ss.padStart(2,'0')}`;
         continue;
       }
-      if (/^\d+$/.test(l)) continue; // Ignorar índice
+      if (/^\d+$/.test(l)) continue;
       buffer.push(l.replace(/<[^>]+>/g, ''));
     }
     flush();
@@ -222,13 +191,12 @@ function parseVTTTranscript(vtt: string): string | null {
   }
 }
 
-function formatTranscript(transcript: any): string {
-  // Se já está formatado (por parseXMLTranscript/VTT), retornar direto
-  if (transcript.text.includes('[') && transcript.text.includes(']')) {
-    return transcript.text;
-  }
-  
-  // Caso contrário, tentar formatar SRT
+function formatTranscript(transcript: { language: string; text: string }): string {
+  if (!transcript?.text) return '';
+  // Já formatado (XML/VTT parsers)
+  if (transcript.text.includes('[') && transcript.text.includes(']')) return transcript.text;
+
+  // Tentar formatar SRT
   const lines = transcript.text.split('\n');
   let formatted = '';
   let currentTime = '';
@@ -236,28 +204,16 @@ function formatTranscript(transcript: any): string {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    
-    // Detectar timestamp no formato SRT (00:00:00,000 --> 00:00:05,000)
     if (line.includes('-->')) {
-      if (currentText) {
-        formatted += `[${currentTime}] ${currentText}\n\n`;
-      }
+      if (currentText) formatted += `[${currentTime}] ${currentText}\n\n`;
       const startTime = line.split('-->')[0].trim();
-      // Converter para formato MM:SS
       const parts = startTime.split(':');
       currentTime = `${parts[1]}:${parts[2].split(',')[0]}`;
       currentText = '';
-    } 
-    // Ignorar números de sequência
-    else if (line && isNaN(Number(line)) && !line.includes('-->')) {
+    } else if (line && isNaN(Number(line))) {
       currentText += (currentText ? ' ' : '') + line;
     }
   }
-
-  // Adicionar o último texto
-  if (currentText) {
-    formatted += `[${currentTime}] ${currentText}\n\n`;
-  }
-
+  if (currentText) formatted += `[${currentTime}] ${currentText}\n\n`;
   return formatted || transcript.text;
 }

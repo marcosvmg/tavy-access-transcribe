@@ -46,6 +46,12 @@ const Index = () => {
       }
 
       setProgress(100);
+      if (!data.transcript || !data.transcript.trim()) {
+        setProcessingStatus("Sem legendas públicas/ASR disponíveis para este vídeo.");
+        toast.info("Este vídeo não possui legendas públicas; não foi possível transcrever.");
+        setState("input");
+        return;
+      }
       setProcessingStatus("Transcrição concluída!");
       setVideoTitle(data.videoTitle);
       setTranscription(data.transcript);
