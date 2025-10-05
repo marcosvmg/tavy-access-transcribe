@@ -13,7 +13,7 @@ serve(async (req) => {
 
   try {
     const { videoUrl } = await req.json();
-    
+
     if (!videoUrl) {
       throw new Error('URL do vídeo é obrigatória');
     }
@@ -28,12 +28,12 @@ serve(async (req) => {
 
     console.log('ID do vídeo:', videoId);
 
-    // Obter informações do vídeo
+    // Obter informações do vídeo (sem precisar de API key)
     const videoInfo = await getVideoInfo(videoId);
-    
-    // Obter a transcrição usando a YouTube Transcript API
+
+    // Obter a transcrição usando a API pública de legendas do YouTube
     const transcript = await getYouTubeTranscript(videoId);
-    
+
     // Formatar a transcrição com timestamps
     const formattedTranscript = formatTranscript(transcript);
 
@@ -43,7 +43,7 @@ serve(async (req) => {
         videoTitle: videoInfo.title,
         transcript: formattedTranscript,
         language: transcript.language || 'pt',
-        hasNoise: false, // YouTube transcripts são geralmente limpos
+        hasNoise: false,
       }),
       {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -80,73 +80,72 @@ function extractVideoId(url: string): string | null {
 }
 
 async function getVideoInfo(videoId: string) {
-  const apiKey = Deno.env.get('GOOGLE_API_KEY');
-  const url = `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&key=${apiKey}&part=snippet`;
+  // Usar o endpoint oEmbed do YouTube para obter o título sem precisar de API Key
+  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(watchUrl)}&format=json`;
 
-  const response = await fetch(url);
+  const response = await fetch(oembedUrl);
   if (!response.ok) {
     const errorText = await response.text();
-    console.error('YouTube API Error:', errorText);
-    throw new Error('Erro ao obter informações do vídeo. Verifique se a API key está correta e se a YouTube Data API v3 está habilitada.');
+    console.error('YouTube oEmbed error:', errorText);
+    // Fallback: retornar um título básico em vez de falhar toda a função
+    return {
+      title: `Vídeo ${videoId}`,
+      description: ''
+    };
   }
 
   const data = await response.json();
-  if (!data.items || data.items.length === 0) {
-    throw new Error('Vídeo não encontrado');
-  }
-
   return {
-    title: data.items[0].snippet.title,
-    description: data.items[0].snippet.description,
+    title: data.title || `Vídeo ${videoId}`,
+    description: ''
   };
 }
 
 async function getYouTubeTranscript(videoId: string) {
   // Usar a API pública de transcrição do YouTube (timedtext)
-  // Esta API não requer autenticação OAuth e funciona com legendas públicas
-  
+  // Funciona com legendas públicas e ASR (auto-geradas)
   try {
-    // Primeiro, tentar obter legendas em português
     const languages = ['pt', 'pt-BR', 'en', 'es'];
-    
+
     for (const lang of languages) {
-      try {
-        const url = `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}`;
-        console.log(`Tentando obter legendas em ${lang}:`, url);
-        
-        const response = await fetch(url);
-        
-        if (response.ok) {
+      const variants = [
+        `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}`,
+        `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}&kind=asr`,
+        `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}&fmt=vtt`,
+        `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}&kind=asr&fmt=vtt`,
+      ];
+
+      for (const url of variants) {
+        try {
+          console.log(`Tentando legendas: ${url}`);
+          const response = await fetch(url);
+          if (!response.ok) continue;
           const text = await response.text();
-          
-          // Verificar se realmente obtivemos legendas
-          if (text && text.trim().length > 0 && !text.includes('<?xml version')) {
-            console.log(`Legendas encontradas em ${lang}`);
-            return {
-              language: lang,
-              text: text,
-            };
+          if (!text || text.trim().length === 0) continue;
+
+          if (text.startsWith('WEBVTT')) {
+            const parsed = parseVTTTranscript(text);
+            if (parsed) return { language: lang, text: parsed };
+            continue;
           }
-          
-          // Se for XML, fazer parsing
-          if (text.includes('<?xml version')) {
+
+          if (text.includes('<transcript')) {
             const parsedText = parseXMLTranscript(text);
-            if (parsedText) {
-              console.log(`Legendas XML encontradas em ${lang}`);
-              return {
-                language: lang,
-                text: parsedText,
-              };
-            }
+            if (parsedText) return { language: lang, text: parsedText };
+            continue;
           }
+
+          // Último recurso, retornar texto cru
+          return { language: lang, text };
+        } catch (err) {
+          console.log(`Erro ao tentar URL ${url}:`, err);
+          continue;
         }
-      } catch (err) {
-        console.log(`Erro ao tentar ${lang}:`, err);
-        continue;
       }
     }
-    
-    throw new Error('Este vídeo não possui legendas disponíveis em português, inglês ou espanhol. Por favor, tente outro vídeo com legendas ativadas.');
+
+    throw new Error('Este vídeo não possui legendas disponíveis em pt, en ou es (públicas/ASR). Tente outro vídeo com legendas.');
   } catch (error) {
     console.error('Erro ao obter transcrição:', error);
     throw error;
@@ -155,27 +154,27 @@ async function getYouTubeTranscript(videoId: string) {
 
 function parseXMLTranscript(xml: string): string | null {
   try {
-    // Extrair texto de tags <text>
-    const textMatches = xml.matchAll(/<text[^>]*start="([^"]*)"[^>]*dur="([^"]*)"[^>]*>([^<]*)<\/text>/g);
+    const textMatches = xml.matchAll(/<text[^>]*start=\"([^\"]*)\"[^>]*dur=\"([^\"]*)\"[^>]*>([\s\S]*?)<\\/text>/g);
     let result = '';
-    
+
     for (const match of textMatches) {
       const start = parseFloat(match[1]);
-      const text = match[3]
+      const raw = match[3]
+        .replace(/\n/g, ' ')
         .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'");
-      
-      // Converter segundos para MM:SS
+
       const minutes = Math.floor(start / 60);
       const seconds = Math.floor(start % 60);
       const timestamp = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-      
+      const text = raw.replace(/<[^>]+>/g, '').trim();
+      if (!text) continue;
       result += `[${timestamp}] ${text}\n`;
     }
-    
+
     return result || null;
   } catch (error) {
     console.error('Erro ao fazer parsing do XML:', error);
@@ -183,13 +182,51 @@ function parseXMLTranscript(xml: string): string | null {
   }
 }
 
+function parseVTTTranscript(vtt: string): string | null {
+  try {
+    const lines = vtt.split(/\r?\n/);
+    let result = '';
+    let currentTime = '';
+    let buffer: string[] = [];
+
+    const flush = () => {
+      const text = buffer.join(' ').trim();
+      if (!text || !currentTime) return;
+      result += `[${currentTime}] ${text}\n`;
+      buffer = [];
+    };
+
+    for (const line of lines) {
+      const l = line.trim();
+      if (!l) { flush(); continue; }
+      // Ex: 00:00:05.000 --> 00:00:07.000
+      if (l.includes('-->')) {
+        flush();
+        const start = l.split('-->')[0].trim();
+        const parts = start.split(':');
+        const mm = parts.length === 3 ? parts[1] : parts[0];
+        const ss = (parts.length === 3 ? parts[2] : parts[1]).split('.')[0];
+        currentTime = `${mm.padStart(2,'0')}:${ss.padStart(2,'0')}`;
+        continue;
+      }
+      if (/^\d+$/.test(l)) continue; // Ignorar índice
+      buffer.push(l.replace(/<[^>]+>/g, ''));
+    }
+    flush();
+    return result || null;
+  } catch (e) {
+    console.error('Erro ao parsear VTT:', e);
+    return null;
+  }
+}
+
 function formatTranscript(transcript: any): string {
-  // Se já está formatado (do parseXMLTranscript), retornar direto
+  // Se já está formatado (por parseXMLTranscript/VTT), retornar direto
   if (transcript.text.includes('[') && transcript.text.includes(']')) {
     return transcript.text;
   }
   
-  // Caso contrário, formatar a transcrição com timestamps
+  // Caso contrário, tentar formatar SRT
   const lines = transcript.text.split('\n');
   let formatted = '';
   let currentTime = '';
